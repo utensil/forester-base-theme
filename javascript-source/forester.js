@@ -1,5 +1,5 @@
 import 'ninja-keys';
-import 'katex';
+import katex from 'katex';
 
 import autoRenderMath from 'katex/contrib/auto-render';
 
@@ -9,100 +9,64 @@ function partition(array, isValid) {
  }, [[], []]);
 }
 
-// KaTeX's default output carries a second, invisible MathML copy of every
-// formula. Dropping it removes about a third of the DOM on math-heavy pages.
-// Trade-off: that copy is what assistive technology reads, so formulas are no
-// longer announced by screen readers (they stay selectable and printable).
-// `macros` is shared so `\gdef` definitions still reach later formulas, which
-// they would not if auto-render created a fresh macro table per call.
-const mathOptions = { output: 'html', macros: {} }
+// Display math keeps KaTeX's own HTML output, because that is where the
+// constructs MathML Core cannot express live: \hline table rules, \cancel
+// strikes, \boxed frames, \overbrace, and the \begin{align}/\begin{CD}
+// environments. Inline math — the large majority of the formulas on a
+// math-heavy page — is rendered as MathML instead: browsers draw it natively, so
+// one formula becomes ~15 elements instead of ~35, building it costs about a
+// fifth as much, and it still carries full semantics for screen readers and
+// copy-as-TeX.
+const displayDelimiters = [
+ { left: '$$', right: '$$', display: true },
+ { left: '\\[', right: '\\]', display: true },
+ { left: '\\begin{equation}', right: '\\end{equation}', display: true },
+ { left: '\\begin{align}', right: '\\end{align}', display: true },
+ { left: '\\begin{alignat}', right: '\\end{alignat}', display: true },
+ { left: '\\begin{gather}', right: '\\end{gather}', display: true },
+ { left: '\\begin{CD}', right: '\\end{CD}', display: true },
+]
 
-// auto-render's own default ignored regions. Rendering a subtree directly
-// bypasses the check it does on the way down, so it has to be repeated here.
-const ignoredTags = ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option']
+const inlineDelimiters = [{ left: '\\(', right: '\\)', display: false }]
 
-const containsMath = text => /\\[\[(]|\$\$|\\begin\{/.test(text)
+// Every engine has MathML Core since January 2023, which is also when
+// `MathMLElement` appeared; older browsers keep HTML output for inline math too.
+const supportsMathML = typeof MathMLElement !== 'undefined'
 
-function isIgnored(element, root) {
- for (let elt = element; elt && elt !== root; elt = elt.parentElement) {
-  if (ignoredTags.includes(elt.nodeName.toLowerCase())) {
-   return true
-  }
- }
- return false
-}
-
-// Elements that directly hold a formula. auto-render parses text node by text
-// node (joining runs of adjacent text nodes first), so handing it these
-// elements renders exactly the same formulas as one call on the whole document.
-function mathHolders(root) {
- const holders = new Set()
- const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
- while (walker.nextNode()) {
-  const node = walker.currentNode
-  if (node.previousSibling && node.previousSibling.nodeType === Node.TEXT_NODE) {
-   continue // the head of this run of text nodes already looked at all of it
-  }
-
-  let text = node.nodeValue || ''
-  let sibling = node.nextSibling
-  while (sibling && sibling.nodeType === Node.TEXT_NODE) {
-   text += sibling.nodeValue || ''
-   sibling = sibling.nextSibling
-  }
-
-  if (!containsMath(text) || !node.parentElement || isIgnored(node.parentElement, root)) {
-   continue
-  }
-
-  holders.add(node.parentElement)
- }
- return [...holders]
-}
-
-// Typesetting used to happen inside the `load` handler, so the browser could
-// neither paint nor handle input until it finished, and the DOM it produced was
-// only laid out afterwards. Render the same formulas in idle slices instead, so
-// the page becomes usable immediately and formulas fill in as it is read.
-function renderMathInIdleSlices(root, options) {
- const schedule = window.requestIdleCallback
-  ? fn => window.requestIdleCallback(fn, { timeout: 1000 })
-  : fn => setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 8 }), 16)
-
- const holders = mathHolders(root)
- let next = 0
- let failures = 0
-
- const step = deadline => {
-  // bound the slice by wall-clock time, not by `didTimeout`: once the timeout
-  // fires Chrome reports no remaining idle time, and trusting that flag would
-  // let this loop run the whole queue as one long task — the freeze this is
-  // here to avoid.
-  const startedAt = performance.now()
-  const budget = deadline.didTimeout ? 8 : Math.max(4, deadline.timeRemaining())
-  while (next < holders.length && performance.now() - startedAt < budget) {
-   try {
-    autoRenderMath(holders[next], options)
-   } catch (e) {
-    if (failures++ < 3) {
-     console.error('KaTeX rendering failed', e)
-    }
-   }
-   next++
-  }
-
-  if (next < holders.length) {
-   schedule(step)
-  }
- }
-
- if (holders.length > 0) {
-  schedule(step)
- }
-}
+// Inline formulas that would lose their rules, strikes or frames as MathML.
+// KaTeX keeps the TeX source in an <annotation>, so these can be re-rendered as
+// HTML after the fact instead of giving up the whole page's savings.
+const needsHtml = /\\(cancel|bcancel|xcancel|boxed|fbox|overbrace|underbrace|hline)\b|\\begin\{CD\}/
 
 window.addEventListener("load", (event) => {
- renderMathInIdleSlices(document.body, mathOptions)
+ // macros are shared across both passes, so a \gdef in one formula reaches the
+ // formulas rendered by the other pass as well
+ const macros = {}
+ const shared = { macros, ignoredClasses: ['katex'] }
+
+ autoRenderMath(document.body, {
+  ...shared,
+  output: 'htmlAndMathml',
+  delimiters: displayDelimiters,
+ })
+
+ autoRenderMath(document.body, {
+  ...shared,
+  output: supportsMathML ? 'mathml' : 'html',
+  delimiters: inlineDelimiters,
+ })
+
+ for (const annotation of document.querySelectorAll('.katex annotation[encoding="application/x-tex"]')) {
+  const tex = annotation.textContent || ''
+  if (!needsHtml.test(tex)) continue
+  const holder = annotation.closest('.katex').parentElement
+  if (!holder || holder.closest('.katex-display')) continue
+  try {
+   katex.render(tex, holder, { displayMode: false, strict: 'ignore', output: 'html', macros })
+  } catch (e) {
+   console.error('KaTeX fallback rendering failed', e)
+  }
+ }
 
  const openAllDetailsAbove = elt => {
   while (elt != null) {
