@@ -10,29 +10,60 @@ function partition(array, isValid) {
 }
 
 // KaTeX's default output carries a second, invisible MathML copy of every
-// formula for accessibility. Dropping it removes about a third of the DOM on
-// math-heavy pages, and the formulas stay selectable and readable.
-const mathOptions = { output: 'html' }
+// formula. Dropping it removes about a third of the DOM on math-heavy pages.
+// Trade-off: that copy is what assistive technology reads, so formulas are no
+// longer announced by screen readers (they stay selectable and printable).
+// `macros` is shared so `\gdef` definitions still reach later formulas, which
+// they would not if auto-render created a fresh macro table per call.
+const mathOptions = { output: 'html', macros: {} }
 
-// Elements that directly contain a formula. auto-render already parses each
-// text node on its own, so handing it these elements renders exactly the same
-// formulas as rendering the whole document at once.
+// auto-render's own default ignored regions. Rendering a subtree directly
+// bypasses the check it does on the way down, so it has to be repeated here.
+const ignoredTags = ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option']
+
+const containsMath = text => /\\[\[(]|\$\$|\\begin\{/.test(text)
+
+function isIgnored(element, root) {
+ for (let elt = element; elt && elt !== root; elt = elt.parentElement) {
+  if (ignoredTags.includes(elt.nodeName.toLowerCase())) {
+   return true
+  }
+ }
+ return false
+}
+
+// Elements that directly hold a formula. auto-render parses text node by text
+// node (joining runs of adjacent text nodes first), so handing it these
+// elements renders exactly the same formulas as one call on the whole document.
 function mathHolders(root) {
  const holders = new Set()
  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
  while (walker.nextNode()) {
   const node = walker.currentNode
-  if (node.nodeValue && /\\[\[(]|\$\$/.test(node.nodeValue)) {
-   holders.add(node.parentElement)
+  if (node.previousSibling && node.previousSibling.nodeType === Node.TEXT_NODE) {
+   continue // the head of this run of text nodes already looked at all of it
   }
+
+  let text = node.nodeValue || ''
+  let sibling = node.nextSibling
+  while (sibling && sibling.nodeType === Node.TEXT_NODE) {
+   text += sibling.nodeValue || ''
+   sibling = sibling.nextSibling
+  }
+
+  if (!containsMath(text) || !node.parentElement || isIgnored(node.parentElement, root)) {
+   continue
+  }
+
+  holders.add(node.parentElement)
  }
  return [...holders]
 }
 
-// Typesetting every formula inside the `load` handler blocks the main thread
-// for seconds on a large forest (the fdip-0001 page: 11,979 formulas, ~8s), and
-// the browser cannot paint or respond until it finishes. Render the same
-// formulas in idle slices instead, so the page becomes usable immediately.
+// Typesetting used to happen inside the `load` handler, so the browser could
+// neither paint nor handle input until it finished, and the DOM it produced was
+// only laid out afterwards. Render the same formulas in idle slices instead, so
+// the page becomes usable immediately and formulas fill in as it is read.
 function renderMathInIdleSlices(root, options) {
  const schedule = window.requestIdleCallback
   ? fn => window.requestIdleCallback(fn, { timeout: 1000 })
@@ -40,13 +71,22 @@ function renderMathInIdleSlices(root, options) {
 
  const holders = mathHolders(root)
  let next = 0
+ let failures = 0
 
  const step = deadline => {
-  while (next < holders.length && (deadline.didTimeout || deadline.timeRemaining() > 4)) {
+  // bound the slice by wall-clock time, not by `didTimeout`: once the timeout
+  // fires Chrome reports no remaining idle time, and trusting that flag would
+  // let this loop run the whole queue as one long task — the freeze this is
+  // here to avoid.
+  const startedAt = performance.now()
+  const budget = deadline.didTimeout ? 8 : Math.max(4, deadline.timeRemaining())
+  while (next < holders.length && performance.now() - startedAt < budget) {
    try {
     autoRenderMath(holders[next], options)
    } catch (e) {
-    console.error('KaTeX rendering failed', e)
+    if (failures++ < 3) {
+     console.error('KaTeX rendering failed', e)
+    }
    }
    next++
   }
