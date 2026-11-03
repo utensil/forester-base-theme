@@ -70,33 +70,92 @@ function renderMathInIdleSlices(root, options) {
   : fn => setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 8 }), 16)
 
  const holders = mathHolders(root)
+ const pending = new Set(holders)
+ const visible = []
+ const queued = new Set()
  let next = 0
  let failures = 0
+ let stepping = false
+ let observer = null
+
+ // visible holders jump the queue; the rest keep document order, so a page that
+ // is merely being scrolled still fills in top to bottom
+ const nextHolder = () => {
+  while (visible.length > 0) {
+   const holder = visible.shift()
+   if (pending.delete(holder)) {
+    return holder
+   }
+  }
+  while (next < holders.length) {
+   const holder = holders[next++]
+   if (pending.delete(holder)) {
+    return holder
+   }
+  }
+  return null
+ }
 
  const step = deadline => {
   // bound the slice by wall-clock time, not by `didTimeout`: once the timeout
   // fires Chrome reports no remaining idle time, and trusting that flag would
   // let this loop run the whole queue as one long task — the freeze this is
   // here to avoid.
+  stepping = true
   const startedAt = performance.now()
   const budget = deadline.didTimeout ? 8 : Math.max(4, deadline.timeRemaining())
-  while (next < holders.length && performance.now() - startedAt < budget) {
+  while (performance.now() - startedAt < budget) {
+   const holder = nextHolder()
+   if (!holder) {
+    break
+   }
+   if (observer) {
+    observer.unobserve(holder)
+   }
    try {
-    autoRenderMath(holders[next], options)
+    autoRenderMath(holder, options)
    } catch (e) {
     if (failures++ < 3) {
      console.error('KaTeX rendering failed', e)
     }
    }
-   next++
   }
+  stepping = false
 
-  if (next < holders.length) {
+  if (pending.size === 0 && visible.length === 0 && observer) {
+   observer.disconnect()
+   observer = null
+  } else {
    schedule(step)
   }
  }
 
- if (holders.length > 0) {
+ // Typeset what the reader can see first, so a page never shows raw TeX where
+ // someone is actually looking — at load, while scrolling, or after a jump into
+ // the middle of a long page. The rest still fills in from idle time.
+ if ('IntersectionObserver' in window && pending.size > 0) {
+  observer = new IntersectionObserver(
+   entries => {
+    for (const entry of entries) {
+     // `pending` is the queue the slicer consumes from, so only flag here; the
+     // slicer removes the holder when it actually renders it
+     if (entry.isIntersecting && pending.has(entry.target) && !queued.has(entry.target)) {
+      queued.add(entry.target)
+      visible.push(entry.target)
+    }
+   }
+    if (!stepping) {
+     schedule(step)
+    }
+   },
+   { rootMargin: '100% 0px 100% 0px' },
+  )
+  for (const holder of pending) {
+   observer.observe(holder)
+  }
+ }
+
+ if (pending.size > 0 || visible.length > 0) {
   schedule(step)
  }
 }
