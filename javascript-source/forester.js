@@ -21,6 +21,10 @@ const mathOptions = { output: 'html', macros: {} }
 // bypasses the check it does on the way down, so it has to be repeated here.
 const ignoredTags = ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option']
 
+// taken out of document order, a formula that defines macros would run after its
+// users, so those are typeset first, in document order
+const definesMacros = /\\[gex]?def\b|\\newcommand\b|\\renewcommand\b|\\providecommand\b/
+
 const containsMath = text => /\\[\[(]|\$\$|\\begin\{/.test(text)
 
 function isIgnored(element, root) {
@@ -75,25 +79,58 @@ function renderMathInIdleSlices(root, options) {
  const queued = new Set()
  let next = 0
  let failures = 0
- let stepping = false
+ let scheduled = false
  let observer = null
 
- // visible holders jump the queue; the rest keep document order, so a page that
- // is merely being scrolled still fills in top to bottom
+ const render = holder => {
+  try {
+   autoRenderMath(holder, options)
+  } catch (e) {
+   if (failures++ < 3) {
+    console.error('KaTeX rendering failed', e)
+   }
+  }
+ }
+
+ // Typeset what the reader can see first, so a page never shows raw TeX where
+ // someone is actually looking — after a jump into the middle of a long page in
+ // particular. Everything else still fills in from document order.
  const nextHolder = () => {
   while (visible.length > 0) {
    const holder = visible.shift()
    if (pending.delete(holder)) {
+    queued.delete(holder)
     return holder
    }
   }
   while (next < holders.length) {
    const holder = holders[next++]
    if (pending.delete(holder)) {
+    queued.delete(holder)
     return holder
    }
   }
   return null
+ }
+
+ const finish = () => {
+  if (observer) {
+   observer.disconnect()
+   observer = null
+  }
+ }
+
+ // one idle callback in flight at a time, so an observer delivery and the tail
+ // of a slice cannot queue two of them
+ const scheduleStep = () => {
+  if (scheduled) {
+   return
+  }
+  scheduled = true
+  schedule(deadline => {
+   scheduled = false
+   step(deadline)
+  })
  }
 
  const step = deadline => {
@@ -101,7 +138,6 @@ function renderMathInIdleSlices(root, options) {
   // fires Chrome reports no remaining idle time, and trusting that flag would
   // let this loop run the whole queue as one long task — the freeze this is
   // here to avoid.
-  stepping = true
   const startedAt = performance.now()
   const budget = deadline.didTimeout ? 8 : Math.max(4, deadline.timeRemaining())
   while (performance.now() - startedAt < budget) {
@@ -112,41 +148,45 @@ function renderMathInIdleSlices(root, options) {
    if (observer) {
     observer.unobserve(holder)
    }
-   try {
-    autoRenderMath(holder, options)
-   } catch (e) {
-    if (failures++ < 3) {
-     console.error('KaTeX rendering failed', e)
-    }
-   }
+   render(holder)
   }
-  stepping = false
 
-  if (pending.size === 0 && visible.length === 0 && observer) {
-   observer.disconnect()
-   observer = null
-  } else {
-   schedule(step)
+  if (pending.size === 0 && visible.length === 0) {
+   finish()
+   return
   }
+  scheduleStep()
  }
 
- // Typeset what the reader can see first, so a page never shows raw TeX where
- // someone is actually looking — at load, while scrolling, or after a jump into
- // the middle of a long page. The rest still fills in from idle time.
- if ('IntersectionObserver' in window && pending.size > 0) {
+ if (pending.size === 0) {
+  return
+ }
+
+ // A formula that defines macros has to be typeset before any formula that might
+ // use one, which taking holders out of document order would otherwise break.
+ for (const holder of holders) {
+  if (!definesMacros.test(holder.textContent || '')) {
+   continue
+  }
+  pending.delete(holder)
+  render(holder)
+ }
+
+ if (pending.size === 0) {
+  return
+ }
+
+ if ('IntersectionObserver' in window) {
   observer = new IntersectionObserver(
    entries => {
     for (const entry of entries) {
-     // `pending` is the queue the slicer consumes from, so only flag here; the
-     // slicer removes the holder when it actually renders it
-     if (entry.isIntersecting && pending.has(entry.target) && !queued.has(entry.target)) {
-      queued.add(entry.target)
-      visible.push(entry.target)
+     if (!entry.isIntersecting || !pending.has(entry.target) || queued.has(entry.target)) {
+      continue
+     }
+     queued.add(entry.target)
+     visible.push(entry.target)
     }
-   }
-    if (!stepping) {
-     schedule(step)
-    }
+    scheduleStep()
    },
    { rootMargin: '100% 0px 100% 0px' },
   )
@@ -155,9 +195,7 @@ function renderMathInIdleSlices(root, options) {
   }
  }
 
- if (pending.size > 0 || visible.length > 0) {
-  schedule(step)
- }
+ scheduleStep()
 }
 
 window.addEventListener("load", (event) => {
