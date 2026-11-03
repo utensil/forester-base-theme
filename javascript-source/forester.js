@@ -9,8 +9,60 @@ function partition(array, isValid) {
  }, [[], []]);
 }
 
+// KaTeX's default output carries a second, invisible MathML copy of every
+// formula for accessibility. Dropping it removes about a third of the DOM on
+// math-heavy pages, and the formulas stay selectable and readable.
+const mathOptions = { output: 'html' }
+
+// Elements that directly contain a formula. auto-render already parses each
+// text node on its own, so handing it these elements renders exactly the same
+// formulas as rendering the whole document at once.
+function mathHolders(root) {
+ const holders = new Set()
+ const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+ while (walker.nextNode()) {
+  const node = walker.currentNode
+  if (node.nodeValue && /\\[\[(]|\$\$/.test(node.nodeValue)) {
+   holders.add(node.parentElement)
+  }
+ }
+ return [...holders]
+}
+
+// Typesetting every formula inside the `load` handler blocks the main thread
+// for seconds on a large forest (the fdip-0001 page: 11,979 formulas, ~8s), and
+// the browser cannot paint or respond until it finishes. Render the same
+// formulas in idle slices instead, so the page becomes usable immediately.
+function renderMathInIdleSlices(root, options) {
+ const schedule = window.requestIdleCallback
+  ? fn => window.requestIdleCallback(fn, { timeout: 1000 })
+  : fn => setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 8 }), 16)
+
+ const holders = mathHolders(root)
+ let next = 0
+
+ const step = deadline => {
+  while (next < holders.length && (deadline.didTimeout || deadline.timeRemaining() > 4)) {
+   try {
+    autoRenderMath(holders[next], options)
+   } catch (e) {
+    console.error('KaTeX rendering failed', e)
+   }
+   next++
+  }
+
+  if (next < holders.length) {
+   schedule(step)
+  }
+ }
+
+ if (holders.length > 0) {
+  schedule(step)
+ }
+}
+
 window.addEventListener("load", (event) => {
- autoRenderMath(document.body)
+ renderMathInIdleSlices(document.body, mathOptions)
 
  const openAllDetailsAbove = elt => {
   while (elt != null) {
